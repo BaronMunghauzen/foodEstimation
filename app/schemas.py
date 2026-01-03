@@ -12,12 +12,42 @@ class PortionEstimate(BaseModel):
     volume_ml: Optional[float] = None
     estimated_portion_size: str  # "small", "medium", "large"
 
+# Новые схемы для дополнительной информации
+class IngredientInfo(BaseModel):
+    name: str
+    calories_per_100g: float
+    proteins_per_100g: float
+    fats_per_100g: float
+    carbs_per_100g: float
+    description: Optional[str] = None  # Краткое описание ингредиента
+    weight_in_portion_g: Optional[float] = None  # Вес ингредиента в порции (граммы)
+    calories_in_portion: Optional[float] = None  # Калории ингредиента в порции
+    proteins_in_portion: Optional[float] = None  # Белки ингредиента в порции (граммы)
+    fats_in_portion: Optional[float] = None  # Жиры ингредиента в порции (граммы)
+    carbs_in_portion: Optional[float] = None  # Углеводы ингредиента в порции (граммы)
+
+class Recommendation(BaseModel):
+    type: str  # "tip" или "alternative"
+    title: str
+    description: str
+    calories_saved: Optional[float] = None  # Для альтернатив: сколько ккал экономится
+
+class MicronutrientInfo(BaseModel):
+    name: str
+    amount: float  # Количество в блюде (единица измерения зависит от типа)
+    unit: str  # Единица измерения (мг, мкг, г и т.д.)
+    daily_value: float  # Суточная норма
+    percent_of_daily_value: float  # Процент от суточной нормы (вычисляется на сервере)
+
 class FoodItem(BaseModel):
     name: str
     confidence: float
     nutrition_per_100g: NutritionInfo
     portion_estimate: PortionEstimate
     total_nutrition: NutritionInfo
+    ingredients: Optional[List[IngredientInfo]] = None  # Детальная информация об ингредиентах
+    recommendations: Optional[List[Recommendation]] = None  # Советы и альтернативы
+    micronutrients: Optional[List[MicronutrientInfo]] = None  # Микронутриенты и витамины
 
 class FoodRecognitionResponse(BaseModel):
     recognized_foods: List[FoodItem]

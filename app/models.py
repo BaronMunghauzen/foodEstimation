@@ -26,6 +26,9 @@ class FoodRequest(Base):
     chatgpt_carbs = Column(Float, nullable=True)
     chatgpt_confidence = Column(Float, nullable=True)
     chatgpt_response_raw = Column(JSON, nullable=True)
+    chatgpt_ingredients = Column(JSON, nullable=True)  # Массив ингредиентов с КБЖУ
+    chatgpt_recommendations = Column(JSON, nullable=True)  # Массив советов и альтернатив
+    chatgpt_micronutrients = Column(JSON, nullable=True)  # Массив микронутриентов и витаминов
     
     # Разница между моделями
     difference_calories = Column(Float, nullable=True)

@@ -2,18 +2,18 @@
 Основное FastAPI приложение для распознавания еды и расчета калорий.
 """
 
-from fastapi import FastAPI, File, UploadFile, Depends, Request, HTTPException
+from fastapi import FastAPI, File, UploadFile, Depends, Request, HTTPException, Form
 from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 from PIL import Image
 import io
 import os
 import time
-from typing import List
+from typing import List, Optional
 
 from app.database import SessionLocal, engine, Base
 from app.models import FoodRequest
-from app.schemas import FoodRecognitionResponse, FoodItem, NutritionInfo, PortionEstimate
+from app.schemas import FoodRecognitionResponse, FoodItem, NutritionInfo, PortionEstimate, IngredientInfo, Recommendation, MicronutrientInfo
 from app.auth import verify_token
 from app.ml_service import init_food_service
 from app.portion_estimator import PortionEstimator
@@ -22,10 +22,44 @@ from app.chatgpt_service import chatgpt_service
 import logging
 import os
 from dotenv import load_dotenv
+import re
+import json
 
 load_dotenv()
 
 logger = logging.getLogger(__name__)
+
+def parse_weight_from_comment(comment: str) -> Optional[float]:
+    """
+    Парсит вес из комментария пользователя.
+    Ищет паттерны типа "300 гр", "300 грамм", "300g", "300 г" и т.д.
+    
+    Args:
+        comment: Комментарий пользователя
+        
+    Returns:
+        Вес в граммах или None если не найден
+    """
+    if not comment:
+        return None
+    
+    # Паттерны для поиска веса
+    patterns = [
+        r'(\d+)\s*(?:гр|грамм|граммов|g|г)\b',
+        r'вес[а]?\s*(?:блюда|порции)?\s*:?\s*(\d+)\s*(?:гр|грамм|граммов|g|г)?',
+        r'(\d+)\s*(?:гр|грамм|граммов|g|г)\s*(?:блюда|порции)?',
+    ]
+    
+    comment_lower = comment.lower()
+    for pattern in patterns:
+        match = re.search(pattern, comment_lower, re.IGNORECASE)
+        if match:
+            weight = float(match.group(1))
+            if 10 <= weight <= 10000:  # Разумные пределы
+                logger.info(f"Извлечен вес из комментария: {weight} г")
+                return weight
+    
+    return None
 
 # Параметры из .env
 USE_LOCAL_MODEL = os.getenv("USE_LOCAL_MODEL", "true").lower() == "true"  # Полностью отключить локальную модель
@@ -85,6 +119,7 @@ async def health_check():
 @app.post("/recognize-food", response_model=FoodRecognitionResponse)
 async def recognize_food(
     file: UploadFile = File(...),
+    comment: Optional[str] = Form(None),
     token: str = Depends(verify_token),
     request: Request = None,
     db: Session = Depends(get_db)
@@ -97,6 +132,7 @@ async def recognize_food(
     
     Args:
         file: Загруженное изображение
+        comment: Опциональный комментарий пользователя (до 100 слов)
         token: Токен аутентификации (из dependency)
         request: FastAPI Request объект
         db: Сессия базы данных
@@ -107,6 +143,18 @@ async def recognize_food(
     start_time = time.time()
     
     try:
+        # Валидация комментария (до 100 слов)
+        user_comment = None
+        if comment:
+            words = comment.strip().split()
+            if len(words) > 100:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Комментарий не должен превышать 100 слов"
+                )
+            user_comment = comment.strip()
+            logger.info(f"Получен комментарий пользователя ({len(words)} слов): {user_comment[:100]}...")
+        
         # Проверяем тип файла
         if not file.content_type or not file.content_type.startswith('image/'):
             raise HTTPException(
@@ -143,13 +191,8 @@ async def recognize_food(
             logger.warning(f"Ошибка сохранения изображения: {e}")
             image_path = None
         
-        # Шаг 1: Оцениваем размер порции (нужен для обоих методов)
-        portion_info = portion_estimator.estimate_portion_size(image)
-        weight_g = portion_info['weight_g']
-        
-        # Шаг 2: Запрашиваем ChatGPT (если включен и не используем свою модель вместо него)
+        # Шаг 1: Запрашиваем ChatGPT (если включен и не используем свою модель вместо него)
         chatgpt_result = None
-        chatgpt_total_nutrition = None
         use_chatgpt_for_response = False
         
         if USE_CHATGPT and not USE_OWN_MODEL_INSTEAD_CHATGPT:
@@ -158,19 +201,11 @@ async def recognize_food(
             else:
                 try:
                     logger.info("Вызов ChatGPT API...")
-                    chatgpt_response = await chatgpt_service.recognize_food(image)
+                    chatgpt_response = await chatgpt_service.recognize_food(image, user_comment=user_comment)
                     if chatgpt_response:
                         chatgpt_result = chatgpt_response
-                        # Рассчитываем для ChatGPT (предполагаем такой же вес порции)
-                        chatgpt_multiplier = weight_g / 100.0
-                        chatgpt_total_nutrition = {
-                            'calories': round(chatgpt_result.get('calories_per_100g', 0) * chatgpt_multiplier, 1),
-                            'proteins': round(chatgpt_result.get('proteins_per_100g', 0) * chatgpt_multiplier, 1),
-                            'fats': round(chatgpt_result.get('fats_per_100g', 0) * chatgpt_multiplier, 1),
-                            'carbs': round(chatgpt_result.get('carbs_per_100g', 0) * chatgpt_multiplier, 1)
-                        }
                         use_chatgpt_for_response = True
-                        logger.info(f"ChatGPT успешно обработал запрос: {chatgpt_result.get('food_name')} - будет использован для ответа")
+                        logger.info(f"ChatGPT успешно обработал запрос: {chatgpt_result.get('food_name')}")
                     else:
                         logger.warning("ChatGPT вернул None (сервис отключен или произошла ошибка)")
                 except Exception as e:
@@ -182,7 +217,58 @@ async def recognize_food(
             elif not USE_CHATGPT:
                 logger.debug("ChatGPT пропущен: USE_CHATGPT=false")
         
-        # Шаг 3: Используем ChatGPT или локальную модель для ответа
+        # Шаг 2: Формируем информацию о порции на основе данных ChatGPT или локальной модели
+        portion_info = None
+        if use_chatgpt_for_response and chatgpt_result:
+            # Используем данные от ChatGPT (ChatGPT сам учитывает комментарий при оценке веса)
+            chatgpt_weight_g = chatgpt_result.get('estimated_weight_g')
+            chatgpt_volume_ml = chatgpt_result.get('estimated_volume_ml')
+            
+            if not chatgpt_weight_g:
+                logger.warning("ChatGPT не вернул вес порции, используем fallback оценку")
+                portion_info_fallback = portion_estimator.estimate_portion_size(image)
+                weight_g = portion_info_fallback['weight_g']
+            else:
+                weight_g = chatgpt_weight_g
+                logger.info(f"Используется вес от ChatGPT: {weight_g} г (учтен комментарий пользователя)")
+            
+            # Объем от ChatGPT или рассчитываем
+            if chatgpt_volume_ml:
+                volume_ml = chatgpt_volume_ml
+            else:
+                volume_ml = weight_g * 1.25  # Примерная оценка
+            
+            # Определяем размер порции
+            if weight_g < 150:
+                portion_size = "small"
+            elif weight_g < 300:
+                portion_size = "medium"
+            else:
+                portion_size = "large"
+            
+            portion_info = {
+                'weight_g': weight_g,
+                'volume_ml': volume_ml,
+                'portion_size': portion_size
+            }
+        elif USE_LOCAL_MODEL and food_service:
+            # Используем PortionEstimator для локальной модели
+            portion_info = portion_estimator.estimate_portion_size(image)
+            weight_g = portion_info['weight_g']
+        
+        # Шаг 3: Рассчитываем total_nutrition для ChatGPT (если используется)
+        chatgpt_total_nutrition = None
+        if use_chatgpt_for_response and chatgpt_result:
+            # Рассчитываем total_nutrition на основе веса порции
+            chatgpt_multiplier = weight_g / 100.0
+            chatgpt_total_nutrition = {
+                'calories': round(chatgpt_result.get('calories_per_100g', 0) * chatgpt_multiplier, 1),
+                'proteins': round(chatgpt_result.get('proteins_per_100g', 0) * chatgpt_multiplier, 1),
+                'fats': round(chatgpt_result.get('fats_per_100g', 0) * chatgpt_multiplier, 1),
+                'carbs': round(chatgpt_result.get('carbs_per_100g', 0) * chatgpt_multiplier, 1)
+            }
+        
+        # Шаг 4: Используем ChatGPT или локальную модель для ответа
         if use_chatgpt_for_response and chatgpt_result:
             # Используем результат ChatGPT
             logger.info("Использование результата ChatGPT для ответа")
@@ -232,13 +318,118 @@ async def recognize_food(
             estimated_portion_size=portion_info['portion_size']
         )
         
+        # Обработка дополнительных данных от ChatGPT (ингредиенты, рекомендации, микронутриенты)
+        ingredients_list = None
+        recommendations_list = None
+        micronutrients_list = None
+        
+        if chatgpt_result:
+            # Обработка ингредиентов
+            if 'ingredients' in chatgpt_result and chatgpt_result['ingredients']:
+                try:
+                    ingredients_list = []
+                    for ing in chatgpt_result['ingredients']:
+                        weight_in_portion_g = ing.get('weight_in_portion_g')
+                        calories_per_100g = ing.get('calories_per_100g', 0.0)
+                        proteins_per_100g = ing.get('proteins_per_100g', 0.0)
+                        fats_per_100g = ing.get('fats_per_100g', 0.0)
+                        carbs_per_100g = ing.get('carbs_per_100g', 0.0)
+                        
+                        # Рассчитываем КБЖУ в порции если известен вес ингредиента
+                        calories_in_portion = None
+                        proteins_in_portion = None
+                        fats_in_portion = None
+                        carbs_in_portion = None
+                        
+                        if weight_in_portion_g and weight_in_portion_g > 0:
+                            multiplier = weight_in_portion_g / 100.0
+                            calories_in_portion = round(calories_per_100g * multiplier, 1)
+                            proteins_in_portion = round(proteins_per_100g * multiplier, 1)
+                            fats_in_portion = round(fats_per_100g * multiplier, 1)
+                            carbs_in_portion = round(carbs_per_100g * multiplier, 1)
+                        
+                        ingredients_list.append(
+                            IngredientInfo(
+                                name=ing.get('name', ''),
+                                calories_per_100g=calories_per_100g,
+                                proteins_per_100g=proteins_per_100g,
+                                fats_per_100g=fats_per_100g,
+                                carbs_per_100g=carbs_per_100g,
+                                description=ing.get('description'),
+                                weight_in_portion_g=weight_in_portion_g,
+                                calories_in_portion=calories_in_portion,
+                                proteins_in_portion=proteins_in_portion,
+                                fats_in_portion=fats_in_portion,
+                                carbs_in_portion=carbs_in_portion
+                            )
+                        )
+                    logger.debug(f"Обработано {len(ingredients_list)} ингредиентов")
+                except Exception as e:
+                    logger.warning(f"Ошибка обработки ингредиентов: {e}", exc_info=True)
+                    ingredients_list = None
+            
+            # Обработка рекомендаций
+            if 'recommendations' in chatgpt_result and chatgpt_result['recommendations']:
+                try:
+                    recommendations_list = [
+                        Recommendation(
+                            type=rec.get('type', 'tip'),
+                            title=rec.get('title', ''),
+                            description=rec.get('description', ''),
+                            calories_saved=rec.get('calories_saved')
+                        )
+                        for rec in chatgpt_result['recommendations']
+                    ]
+                    logger.debug(f"Обработано {len(recommendations_list)} рекомендаций")
+                except Exception as e:
+                    logger.warning(f"Ошибка обработки рекомендаций: {e}")
+                    recommendations_list = None
+            
+            # Обработка микронутриентов с вычислением процента от суточной нормы
+            if 'micronutrients' in chatgpt_result and chatgpt_result['micronutrients']:
+                try:
+                    micronutrients_list = []
+                    for micron in chatgpt_result['micronutrients']:
+                        amount = float(micron.get('amount', 0.0))
+                        daily_value = float(micron.get('daily_value', 1.0))
+                        
+                        # Вычисляем процент от суточной нормы
+                        percent_of_daily_value = 0.0
+                        if daily_value > 0:
+                            percent_of_daily_value = round((amount / daily_value) * 100, 2)
+                        
+                        # Масштабируем на вес порции (если нужно)
+                        # По умолчанию ChatGPT должен возвращать данные на 100г, но проверим
+                        multiplier = weight_g / 100.0
+                        scaled_amount = amount * multiplier
+                        scaled_percent = 0.0
+                        if daily_value > 0:
+                            scaled_percent = round((scaled_amount / daily_value) * 100, 2)
+                        
+                        micronutrients_list.append(
+                            MicronutrientInfo(
+                                name=micron.get('name', ''),
+                                amount=scaled_amount,  # Количество в порции
+                                unit=micron.get('unit', 'мг'),
+                                daily_value=daily_value,
+                                percent_of_daily_value=scaled_percent
+                            )
+                        )
+                    logger.debug(f"Обработано {len(micronutrients_list)} микронутриентов")
+                except Exception as e:
+                    logger.warning(f"Ошибка обработки микронутриентов: {e}", exc_info=True)
+                    micronutrients_list = None
+        
         # Формируем ответ
         food_item = FoodItem(
             name=recognition_result['food_name'],
             confidence=recognition_result['confidence'],
             nutrition_per_100g=NutritionInfo(**nutrition_per_100g),
             portion_estimate=portion_estimate,
-            total_nutrition=total_nutrition
+            total_nutrition=total_nutrition,
+            ingredients=ingredients_list,
+            recommendations=recommendations_list,
+            micronutrients=micronutrients_list
         )
         
         processing_time = time.time() - start_time
@@ -327,6 +518,9 @@ async def recognize_food(
                 chatgpt_carbs=chatgpt_total_nutrition['carbs'] if chatgpt_total_nutrition else None,
                 chatgpt_confidence=chatgpt_result.get('confidence') if chatgpt_result else None,
                 chatgpt_response_raw=chatgpt_result if chatgpt_result else None,
+                chatgpt_ingredients=[ing.model_dump() for ing in ingredients_list] if ingredients_list else None,
+                chatgpt_recommendations=[rec.model_dump() for rec in recommendations_list] if recommendations_list else None,
+                chatgpt_micronutrients=[mic.model_dump() for mic in micronutrients_list] if micronutrients_list else None,
                 
                 # Разница между моделями (если обе были получены)
                 difference_calories=difference_calories,

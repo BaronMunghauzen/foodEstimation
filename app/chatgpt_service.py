@@ -117,12 +117,13 @@ class ChatGPTNutritionService:
                 self.enabled = False
                 self.proxy_url = None
     
-    async def recognize_food(self, image: Image.Image) -> Optional[Dict]:
+    async def recognize_food(self, image: Image.Image, user_comment: Optional[str] = None) -> Optional[Dict]:
         """
         Распознает еду и оценивает калории через ChatGPT Vision API
         
         Args:
             image: PIL Image объекта
+            user_comment: Опциональный комментарий пользователя (до 100 слов)
             
         Returns:
             dict с результатами или None если ошибка/отключен
@@ -142,6 +143,64 @@ class ChatGPTNutritionService:
             image_base64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
             logger.debug(f"Изображение конвертировано: размер {image_size} байт, base64 длина {len(image_base64)} символов")
             
+            # Подготовка промпта
+            prompt = """Распознай это блюдо на фотографии и определи примерную калорийность и БЖУ (белки, жиры, углеводы) на 100 грамм.
+
+Также оцени примерный вес порции на фотографии в граммах, основываясь на размере блюда, типе посуды и визуальной оценке.
+
+Ответь строго в JSON формате:
+{
+    "food_name": "название блюда",
+    "calories_per_100g": число,
+    "proteins_per_100g": число,
+    "fats_per_100g": число,
+    "carbs_per_100g": число,
+    "confidence": число от 0 до 1,
+    "estimated_weight_g": число (примерный вес порции на фотографии в граммах),
+    "estimated_volume_ml": число (примерный объем порции в миллилитрах),
+    "ingredients": [
+        {
+            "name": "название ингредиента",
+            "calories_per_100g": число,
+            "proteins_per_100g": число,
+            "fats_per_100g": число,
+            "carbs_per_100g": число,
+            "description": "краткое описание ингредиента",
+            "weight_in_portion_g": число (примерный вес этого ингредиента в порции в граммах)
+        }
+    ],
+    "recommendations": [
+        {
+            "type": "tip" или "alternative",
+            "title": "краткое название совета/альтернативы",
+            "description": "подробное описание",
+            "calories_saved": число (только для альтернатив, может быть null)
+        }
+    ],
+    "micronutrients": [
+        {
+            "name": "название витамина/минерала (например: Витамин C, Кальций, Железо)",
+            "amount": число (количество в блюде на 100г),
+            "unit": "единица измерения (мг, мкг, г)",
+            "daily_value": число (суточная норма для взрослого человека)
+        }
+    ]
+}
+
+Важно:
+- estimated_weight_g: оцени вес порции на фотографии на основе визуального анализа (размер блюда, тип посуды)
+- estimated_volume_ml: оцени объем порции в миллилитрах
+- ingredients: массив основных ингредиентов блюда с их КБЖУ на 100г и примерным весом в порции (weight_in_portion_g)
+- weight_in_portion_g: сумма всех weight_in_portion_g должна приблизительно равняться estimated_weight_g
+- recommendations: советы по улучшению ("tip") или альтернативы ("alternative")
+- micronutrients: основные витамины и минералы, которые есть в блюде (amount указан на 100г)
+- daily_value для micronutrients указывай в тех же единицах, что и amount"""
+
+            # Добавляем комментарий пользователя к промпту если есть
+            if user_comment:
+                prompt += f"\n\nДополнительная информация от пользователя: {user_comment}\nВнимательно учти эту информацию при анализе блюда. Если в комментарии указан вес порции (например, '300 грамм', 'вес 250г'), обязательно используй это значение для estimated_weight_g. Если вес не указан напрямую, но есть другая информация, учитывай её при оценке веса порции."
+                logger.debug(f"Добавлен комментарий пользователя: {user_comment[:100]}...")
+            
             # Подготовка запроса
             model = "gpt-4o"
             logger.info(f"Отправка запроса к ChatGPT API (модель: {model})")
@@ -158,17 +217,7 @@ class ChatGPTNutritionService:
                     "content": [
                         {
                             "type": "text",
-                            "text": """Распознай это блюдо на фотографии и определи примерную калорийность и БЖУ (белки, жиры, углеводы) на 100 грамм.
-
-Ответь строго в JSON формате:
-{
-    "food_name": "название блюда",
-    "calories_per_100g": число,
-    "proteins_per_100g": число,
-    "fats_per_100g": число,
-    "carbs_per_100g": число,
-    "confidence": число от 0 до 1
-}"""
+                            "text": prompt
                         },
                         {
                             "type": "image_url",
@@ -179,7 +228,7 @@ class ChatGPTNutritionService:
                         }
                     ]
                 }],
-                max_tokens=200,
+                max_tokens=2000,  # Увеличено для дополнительной информации
                 temperature=0.3  # Низкая температура для более точных ответов
             )
             request_duration = time.time() - request_start_time
