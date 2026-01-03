@@ -1,0 +1,23 @@
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+python-multipart==0.0.6
+sqlalchemy==2.0.23
+psycopg2-binary==2.9.9
+alembic>=1.12.0
+pydantic==2.5.0
+pydantic-settings==2.1.0
+tokenizers>=0.14.0
+transformers>=4.40.0
+# CPU-only версия torch (намного меньше, ~200MB вместо ~900MB)
+# Для GPU версии замените на: torch>=2.2.0 (без --extra-index-url)
+torch>=2.2.0
+torchvision>=0.17.0
+Pillow==10.1.0
+python-dotenv==1.0.0
+numpy>=1.26.0,<2.0.0
+opencv-python==4.8.1.78
+openai>=1.0.0
+httpx>=0.28.0
+httpx[socks]>=0.28.0  # Поддержка SOCKS5/SOCKS4 прокси (базовая)
+httpx-socks>=0.8.0  # Расширенная поддержка SOCKS5/SOCKS4 с аутентификацией (рекомендуется)
+
