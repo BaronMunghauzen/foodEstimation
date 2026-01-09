@@ -898,6 +898,87 @@ async def create_meal_plan(
             
             return processed_meals
         
+        # Функция для корректировки порций при превышении КБЖУ
+        def adjust_portions_for_kbju(meals_data: list, recipes_dict: dict, target_cal: float, 
+                                     target_prot: float, target_fat: float, target_carb: float) -> list:
+            """Корректирует порции блюд, если превышение КБЖУ более 5%"""
+            # Сначала рассчитываем текущие КБЖУ
+            total_cal = 0.0
+            total_prot = 0.0
+            total_fat = 0.0
+            total_carb = 0.0
+            
+            # Собираем все блюда с их порциями
+            all_items = []
+            for meal_data in meals_data:
+                for item in meal_data.get('meals', []):
+                    meal_uuid = item.get('uuid', '')
+                    if meal_uuid in recipes_dict:
+                        portions = item.get('portions', 1)
+                        recipe_info = recipes_dict[meal_uuid]
+                        all_items.append({
+                            'item': item,
+                            'meal_data': meal_data,
+                            'portions': portions,
+                            'calories': recipe_info['calories'],
+                            'proteins': recipe_info['proteins'],
+                            'fats': recipe_info['fats'],
+                            'carbs': recipe_info['carbs']
+                        })
+                        total_cal += recipe_info['calories'] * portions
+                        total_prot += recipe_info['proteins'] * portions
+                        total_fat += recipe_info['fats'] * portions
+                        total_carb += recipe_info['carbs'] * portions
+            
+            # Проверяем превышение (максимум 5%)
+            max_cal = target_cal * 1.05
+            max_prot = target_prot * 1.05
+            max_fat = target_fat * 1.05
+            max_carb = target_carb * 1.05
+            
+            # Если превышение незначительное, возвращаем как есть
+            if total_cal <= max_cal and total_prot <= max_prot and total_fat <= max_fat and total_carb <= max_carb:
+                return meals_data
+            
+            # Рассчитываем коэффициент уменьшения (берем максимальный из всех превышений)
+            cal_ratio = max_cal / total_cal if total_cal > 0 else 1.0
+            prot_ratio = max_prot / total_prot if total_prot > 0 else 1.0
+            fat_ratio = max_fat / total_fat if total_fat > 0 else 1.0
+            carb_ratio = max_carb / total_carb if total_carb > 0 else 1.0
+            
+            # Используем минимальный коэффициент (самое строгое ограничение)
+            reduction_ratio = min(cal_ratio, prot_ratio, fat_ratio, carb_ratio)
+            
+            # Если превышение небольшое (меньше 10%), не корректируем слишком агрессивно
+            if reduction_ratio > 0.95:
+                reduction_ratio = 0.95
+            
+            logger.info(f"Корректировка порций: коэффициент уменьшения {reduction_ratio:.3f} (было: калории {total_cal:.1f}, белки {total_prot:.1f}, жиры {total_fat:.1f}, углеводы {total_carb:.1f})")
+            
+            # Применяем корректировку к порциям
+            adjusted_meals = []
+            for meal_data in meals_data:
+                adjusted_meal = {
+                    'category': meal_data.get('category', ''),
+                    'meals': []
+                }
+                
+                for item in meal_data.get('meals', []):
+                    meal_uuid = item.get('uuid', '')
+                    if meal_uuid in recipes_dict:
+                        original_portions = item.get('portions', 1)
+                        # Уменьшаем порции пропорционально
+                        new_portions = max(1, int(round(original_portions * reduction_ratio)))
+                        
+                        adjusted_item = item.copy()
+                        adjusted_item['portions'] = new_portions
+                        adjusted_meal['meals'].append(adjusted_item)
+                
+                if adjusted_meal['meals']:
+                    adjusted_meals.append(adjusted_meal)
+            
+            return adjusted_meals
+        
         # Обрабатываем результат ChatGPT и рассчитываем фактические КБЖУ
         days_plan = []
         for day_data in chatgpt_result.get('days', []):
@@ -906,6 +987,17 @@ async def create_meal_plan(
             
             # Применяем постобработку: убираем дубликаты и объединяем гарниры
             processed_meals_data = postprocess_meals(meals_data, recipes_dict)
+            
+            # Корректируем порции, если превышение КБЖУ более 5%
+            target_cal = request_data.target_nutrition.calories
+            target_prot = request_data.target_nutrition.proteins
+            target_fat = request_data.target_nutrition.fats
+            target_carb = request_data.target_nutrition.carbs
+            
+            processed_meals_data = adjust_portions_for_kbju(
+                processed_meals_data, recipes_dict, 
+                target_cal, target_prot, target_fat, target_carb
+            )
             
             # Рассчитываем фактические КБЖУ для дня
             actual_calories = 0.0
@@ -946,17 +1038,11 @@ async def create_meal_plan(
                         Meal(category=category, meals=meal_items_list)
                     )
             
-            # Проверяем превышение целевых КБЖУ
-            target_cal = request_data.target_nutrition.calories
-            target_prot = request_data.target_nutrition.proteins
-            target_fat = request_data.target_nutrition.fats
-            target_carb = request_data.target_nutrition.carbs
-            
-            # Допустимое превышение: 10%
-            max_allowed_cal = target_cal * 1.1
-            max_allowed_prot = target_prot * 1.1
-            max_allowed_fat = target_fat * 1.1
-            max_allowed_carb = target_carb * 1.1
+            # Проверяем превышение целевых КБЖУ (допустимое превышение: 5%)
+            max_allowed_cal = target_cal * 1.05
+            max_allowed_prot = target_prot * 1.05
+            max_allowed_fat = target_fat * 1.05
+            max_allowed_carb = target_carb * 1.05
             
             # Проверяем превышение
             if actual_calories > max_allowed_cal:
@@ -1036,14 +1122,14 @@ async def create_meal_plan(
         for day_plan in days_plan:
             target_cal = day_plan.target_nutrition.calories
             actual_cal = day_plan.actual_nutrition.calories
-            if actual_cal > target_cal * 1.1:  # Превышение более 10%
+            if actual_cal > target_cal * 1.05:  # Превышение более 5%
                 total_excess_days += 1
         
         # Формируем сообщение с предупреждением, если есть превышение
         message = f"Программа питания успешно создана на {request_data.days_count} дней"
         if total_excess_days > 0:
-            message += f". ВНИМАНИЕ: В {total_excess_days} дне(днях) превышение целевых КБЖУ более чем на 10%. Рекомендуется пересмотреть программу."
-            logger.warning(f"Обнаружено превышение КБЖУ в {total_excess_days} днях из {request_data.days_count}")
+            message += f". ВНИМАНИЕ: В {total_excess_days} дне(днях) превышение целевых КБЖУ более чем на 5%. Порции были автоматически скорректированы."
+            logger.warning(f"Обнаружено превышение КБЖУ в {total_excess_days} днях из {request_data.days_count}, порции скорректированы")
         
         processing_time = time.time() - start_time
         
