@@ -65,3 +65,45 @@ class FoodRequestCreate(BaseModel):
     confidence: Optional[float] = None
     full_response: Optional[dict] = None
 
+# Схемы для программы питания
+class RecipeInfo(BaseModel):
+    """Информация о рецепте для программы питания"""
+    uuid: str
+    name: str
+    category: str  # Категория блюда (завтрак, обед, ужин, салат и т.д.)
+    calories: float  # КБЖУ в 1 порции
+    proteins: float
+    fats: float
+    carbs: float
+
+class MealPlanRequest(BaseModel):
+    """Запрос на создание программы питания"""
+    meals_per_day: int  # Количество приемов пищи в день (минимум 3)
+    days_count: int  # Количество дней
+    target_nutrition: NutritionInfo  # Целевые КБЖУ
+    allowed_recipes: List[RecipeInfo]  # Список доступных рецептов
+
+class MealItem(BaseModel):
+    """Блюдо в приеме пищи"""
+    uuid: str
+    name: str
+    portions: int = 1  # Количество порций этого блюда (по умолчанию 1)
+
+class Meal(BaseModel):
+    """Прием пищи"""
+    category: str  # Название категории (завтрак, обед, ужин и т.д.)
+    meals: List[MealItem]  # Список блюд (может быть несколько, если объединены)
+
+class DayPlan(BaseModel):
+    """План питания на день"""
+    day_number: int
+    target_nutrition: NutritionInfo  # Целевые КБЖУ
+    actual_nutrition: NutritionInfo  # Фактическое КБЖУ из программы
+    meals: List[Meal]  # Список приемов пищи
+
+class MealPlanResponse(BaseModel):
+    """Ответ с программой питания"""
+    days: List[DayPlan]
+    message: str
+    processing_time_seconds: Optional[float] = None
+

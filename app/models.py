@@ -42,3 +42,26 @@ class FoodRequest(Base):
     client_ip = Column(String, nullable=True)
     training_used = Column(Boolean, default=False)  # Использовано ли для обучения
 
+class MealPlan(Base):
+    __tablename__ = "meal_plans"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    timestamp = Column(DateTime(timezone=True), server_default=func.now())
+    
+    # Параметры запроса
+    meals_per_day = Column(Integer, nullable=False)
+    days_count = Column(Integer, nullable=False)
+    target_calories = Column(Float, nullable=False)
+    target_proteins = Column(Float, nullable=False)
+    target_fats = Column(Float, nullable=False)
+    target_carbs = Column(Float, nullable=False)
+    
+    # Данные запроса (JSON)
+    allowed_recipes = Column(JSON, nullable=False)  # Список рецептов из запроса
+    
+    # Ответ ChatGPT (полный JSON)
+    chatgpt_response_raw = Column(JSON, nullable=False)  # Полный JSON ответ от ChatGPT
+    
+    # Метаданные
+    client_ip = Column(String, nullable=True)
+

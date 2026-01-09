@@ -12,8 +12,12 @@ import time
 from typing import List, Optional
 
 from app.database import SessionLocal, engine, Base
-from app.models import FoodRequest
-from app.schemas import FoodRecognitionResponse, FoodItem, NutritionInfo, PortionEstimate, IngredientInfo, Recommendation, MicronutrientInfo
+from app.models import FoodRequest, MealPlan
+from app.schemas import (
+    FoodRecognitionResponse, FoodItem, NutritionInfo, PortionEstimate, 
+    IngredientInfo, Recommendation, MicronutrientInfo,
+    MealPlanRequest, MealPlanResponse, DayPlan, Meal, MealItem, RecipeInfo
+)
 from app.auth import verify_token
 from app.ml_service import init_food_service
 from app.portion_estimator import PortionEstimator
@@ -103,6 +107,7 @@ async def root():
         "version": "1.0.0",
         "endpoints": {
             "recognize": "/recognize-food",
+            "create_meal_plan": "/create-meal-plan",
             "health": "/health",
             "docs": "/docs"
         }
@@ -685,6 +690,376 @@ async def train_model(
                 "status": "error",
                 "error": str(e)
             }
+        )
+
+@app.post("/create-meal-plan", response_model=MealPlanResponse)
+async def create_meal_plan(
+    request_data: MealPlanRequest,
+    token: str = Depends(verify_token),
+    request: Request = None,
+    db: Session = Depends(get_db)
+):
+    """
+    Эндпоинт для создания программы питания с помощью ChatGPT.
+    
+    Требует токен аутентификации в заголовке:
+    Authorization: Bearer <your-token>
+    
+    Args:
+        request_data: Данные запроса (meals_per_day, days_count, target_nutrition, allowed_recipes)
+        token: Токен аутентификации (из dependency)
+        request: FastAPI Request объект
+        db: Сессия базы данных
+        
+    Returns:
+        MealPlanResponse с программой питания на указанное количество дней
+    """
+    start_time = time.time()
+    
+    try:
+        # Валидация входных данных
+        if request_data.meals_per_day < 3:
+            raise HTTPException(
+                status_code=400,
+                detail="Количество приемов пищи в день должно быть не менее 3"
+            )
+        
+        if request_data.days_count < 1:
+            raise HTTPException(
+                status_code=400,
+                detail="Количество дней должно быть не менее 1"
+            )
+        
+        if not request_data.allowed_recipes:
+            raise HTTPException(
+                status_code=400,
+                detail="Список рецептов не может быть пустым"
+            )
+        
+        # Проверяем, что все рецепты имеют валидные данные
+        recipes_dict = {}  # Словарь для быстрого доступа по UUID
+        for recipe in request_data.allowed_recipes:
+            if not recipe.uuid or not recipe.name:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Рецепт должен иметь UUID и название"
+                )
+            recipes_dict[recipe.uuid] = {
+                'name': recipe.name,
+                'category': recipe.category,
+                'calories': recipe.calories,
+                'proteins': recipe.proteins,
+                'fats': recipe.fats,
+                'carbs': recipe.carbs
+            }
+        
+        logger.info(f"Создание программы питания: {request_data.days_count} дней, {request_data.meals_per_day} приемов пищи в день")
+        logger.info(f"Целевые КБЖУ: {request_data.target_nutrition.calories} ккал, "
+                   f"{request_data.target_nutrition.proteins}г белков, "
+                   f"{request_data.target_nutrition.fats}г жиров, "
+                   f"{request_data.target_nutrition.carbs}г углеводов")
+        logger.info(f"Доступно рецептов: {len(request_data.allowed_recipes)}")
+        
+        # Подготавливаем данные для ChatGPT
+        allowed_recipes_list = [
+            {
+                'uuid': r.uuid,
+                'name': r.name,
+                'category': r.category,
+                'calories': r.calories,
+                'proteins': r.proteins,
+                'fats': r.fats,
+                'carbs': r.carbs
+            }
+            for r in request_data.allowed_recipes
+        ]
+        
+        # Вызываем ChatGPT для генерации программы питания
+        if not chatgpt_service.enabled:
+            raise HTTPException(
+                status_code=503,
+                detail="ChatGPT сервис недоступен (проверьте OPENAI_API_KEY в .env)"
+            )
+        
+        logger.info("Вызов ChatGPT API для генерации программы питания...")
+        chatgpt_result = await chatgpt_service.generate_meal_plan(
+            meals_per_day=request_data.meals_per_day,
+            days_count=request_data.days_count,
+            target_calories=request_data.target_nutrition.calories,
+            target_proteins=request_data.target_nutrition.proteins,
+            target_fats=request_data.target_nutrition.fats,
+            target_carbs=request_data.target_nutrition.carbs,
+            allowed_recipes=allowed_recipes_list
+        )
+        
+        if not chatgpt_result:
+            raise HTTPException(
+                status_code=500,
+                detail="Не удалось сгенерировать программу питания через ChatGPT"
+            )
+        
+        logger.info(f"ChatGPT успешно сгенерировал программу питания")
+        
+        # Функция для определения, является ли блюдо гарниром
+        def is_side_dish(name: str, category: str) -> bool:
+            """Определяет, является ли блюдо гарниром"""
+            name_lower = name.lower()
+            side_dish_keywords = ['пюре', 'рис', 'гречка', 'макароны', 'паста', 'картофель', 
+                                 'овощи', 'салат', 'гарнир', 'каша', 'овсянка', 'перловка']
+            return any(keyword in name_lower for keyword in side_dish_keywords)
+        
+        # Функция для определения, является ли блюдо основным
+        def is_main_dish(name: str, category: str) -> bool:
+            """Определяет, является ли блюдо основным (мясо, рыба, птица)"""
+            name_lower = name.lower()
+            main_dish_keywords = ['котлет', 'куриц', 'мясо', 'рыб', 'говядин', 'свинин', 
+                                 'индейк', 'телятин', 'стейк', 'шашлык', 'бифштекс']
+            return any(keyword in name_lower for keyword in main_dish_keywords)
+        
+        # Функция постобработки: объединяет гарниры с основными блюдами (без удаления дубликатов)
+        def postprocess_meals(meals_data: list, recipes_dict: dict) -> list:
+            """Постобработка приемов пищи: объединяет гарниры с основными блюдами"""
+            processed_meals = []
+            
+            for meal_data in meals_data:
+                category = meal_data.get('category', '')
+                meals_items = meal_data.get('meals', [])
+                
+                # Проверяем валидность UUID и объединяем одинаковые блюда без portions
+                # Если ChatGPT вернул дубликаты без portions, объединяем их в одно блюдо с правильным количеством порций
+                valid_items = []
+                items_by_uuid = {}  # Группируем по UUID
+                
+                for item in meals_items:
+                    meal_uuid = item.get('uuid', '')
+                    if meal_uuid and meal_uuid in recipes_dict:
+                        portions = item.get('portions', 1)
+                        
+                        # Если portions не указан явно, считаем это как 1 порция
+                        # Если блюдо уже есть, увеличиваем количество порций
+                        if meal_uuid in items_by_uuid:
+                            # Если у существующего блюда не указаны portions, считаем их как 1
+                            existing_portions = items_by_uuid[meal_uuid].get('portions', 1)
+                            items_by_uuid[meal_uuid]['portions'] = existing_portions + portions
+                        else:
+                            # Создаем новое блюдо
+                            new_item = item.copy()
+                            if 'portions' not in new_item:
+                                new_item['portions'] = 1
+                            items_by_uuid[meal_uuid] = new_item
+                
+                # Преобразуем обратно в список
+                valid_items = list(items_by_uuid.values())
+                
+                # Разделяем на гарниры и основные блюда для лучшего объединения
+                side_dishes = []
+                main_dishes = []
+                other_dishes = []
+                
+                for item in valid_items:
+                    meal_uuid = item.get('uuid', '')
+                    recipe_info = recipes_dict[meal_uuid]
+                    name = recipe_info['name']
+                    cat = recipe_info['category']
+                    
+                    if is_side_dish(name, cat):
+                        side_dishes.append(item)
+                    elif is_main_dish(name, cat):
+                        main_dishes.append(item)
+                    else:
+                        other_dishes.append(item)
+                
+                # Объединяем гарниры с основными блюдами (опционально, если есть)
+                final_items = []
+                
+                # Если есть основные блюда, объединяем с гарнирами
+                if main_dishes:
+                    # Каждое основное блюдо может иметь гарнир
+                    for main_dish in main_dishes:
+                        final_items.append(main_dish)
+                        # Добавляем один гарнир к основному блюду, если есть
+                        if side_dishes:
+                            final_items.append(side_dishes.pop(0))
+                    # Остальные гарниры добавляем отдельно (если остались)
+                    final_items.extend(side_dishes)
+                else:
+                    # Если нет основных блюд, просто добавляем все
+                    final_items.extend(side_dishes)
+                
+                # Добавляем остальные блюда
+                final_items.extend(other_dishes)
+                
+                # Если после обработки остались блюда, добавляем прием пищи
+                if final_items:
+                    processed_meals.append({
+                        'category': category,
+                        'meals': final_items
+                    })
+            
+            return processed_meals
+        
+        # Обрабатываем результат ChatGPT и рассчитываем фактические КБЖУ
+        days_plan = []
+        for day_data in chatgpt_result.get('days', []):
+            day_number = day_data.get('day_number', 0)
+            meals_data = day_data.get('meals', [])
+            
+            # Применяем постобработку: убираем дубликаты и объединяем гарниры
+            processed_meals_data = postprocess_meals(meals_data, recipes_dict)
+            
+            # Рассчитываем фактические КБЖУ для дня
+            actual_calories = 0.0
+            actual_proteins = 0.0
+            actual_fats = 0.0
+            actual_carbs = 0.0
+            
+            meals_list = []
+            for meal_data in processed_meals_data:
+                category = meal_data.get('category', '')
+                meals_items = meal_data.get('meals', [])
+                
+                meal_items_list = []
+                for meal_item_data in meals_items:
+                    meal_uuid = meal_item_data.get('uuid', '')
+                    meal_name = meal_item_data.get('name', '')
+                    portions = meal_item_data.get('portions', 1)  # Количество порций (по умолчанию 1)
+                    
+                    # Проверяем, что рецепт существует в списке доступных
+                    if meal_uuid not in recipes_dict:
+                        logger.warning(f"Рецепт с UUID {meal_uuid} не найден в списке доступных рецептов")
+                        continue
+                    
+                    recipe_info = recipes_dict[meal_uuid]
+                    
+                    # Добавляем КБЖУ этого рецепта к общим КБЖУ дня (с учетом количества порций)
+                    actual_calories += recipe_info['calories'] * portions
+                    actual_proteins += recipe_info['proteins'] * portions
+                    actual_fats += recipe_info['fats'] * portions
+                    actual_carbs += recipe_info['carbs'] * portions
+                    
+                    meal_items_list.append(
+                        MealItem(uuid=meal_uuid, name=meal_name, portions=portions)
+                    )
+                
+                if meal_items_list:  # Добавляем только если есть блюда
+                    meals_list.append(
+                        Meal(category=category, meals=meal_items_list)
+                    )
+            
+            # Проверяем превышение целевых КБЖУ
+            target_cal = request_data.target_nutrition.calories
+            target_prot = request_data.target_nutrition.proteins
+            target_fat = request_data.target_nutrition.fats
+            target_carb = request_data.target_nutrition.carbs
+            
+            # Допустимое превышение: 10%
+            max_allowed_cal = target_cal * 1.1
+            max_allowed_prot = target_prot * 1.1
+            max_allowed_fat = target_fat * 1.1
+            max_allowed_carb = target_carb * 1.1
+            
+            # Проверяем превышение
+            if actual_calories > max_allowed_cal:
+                excess_percent = ((actual_calories - target_cal) / target_cal) * 100
+                logger.warning(
+                    f"День {day_number}: Превышение калорий на {excess_percent:.1f}% "
+                    f"(целевые: {target_cal}, фактические: {actual_calories:.1f})"
+                )
+            
+            if actual_proteins > max_allowed_prot:
+                excess_percent = ((actual_proteins - target_prot) / target_prot) * 100
+                logger.warning(
+                    f"День {day_number}: Превышение белков на {excess_percent:.1f}% "
+                    f"(целевые: {target_prot}, фактические: {actual_proteins:.1f})"
+                )
+            
+            if actual_fats > max_allowed_fat:
+                excess_percent = ((actual_fats - target_fat) / target_fat) * 100
+                logger.warning(
+                    f"День {day_number}: Превышение жиров на {excess_percent:.1f}% "
+                    f"(целевые: {target_fat}, фактические: {actual_fats:.1f})"
+                )
+            
+            if actual_carbs > max_allowed_carb:
+                excess_percent = ((actual_carbs - target_carb) / target_carb) * 100
+                logger.warning(
+                    f"День {day_number}: Превышение углеводов на {excess_percent:.1f}% "
+                    f"(целевые: {target_carb}, фактические: {actual_carbs:.1f})"
+                )
+            
+            # Создаем план дня
+            days_plan.append(
+                DayPlan(
+                    day_number=day_number,
+                    target_nutrition=NutritionInfo(
+                        calories=target_cal,
+                        proteins=target_prot,
+                        fats=target_fat,
+                        carbs=target_carb
+                    ),
+                    actual_nutrition=NutritionInfo(
+                        calories=round(actual_calories, 1),
+                        proteins=round(actual_proteins, 1),
+                        fats=round(actual_fats, 1),
+                        carbs=round(actual_carbs, 1)
+                    ),
+                    meals=meals_list
+                )
+            )
+        
+        # Получаем IP клиента
+        client_ip = None
+        if request:
+            client_ip = request.client.host if request.client else None
+        
+        # Сохраняем в БД
+        db_meal_plan = MealPlan(
+            meals_per_day=request_data.meals_per_day,
+            days_count=request_data.days_count,
+            target_calories=request_data.target_nutrition.calories,
+            target_proteins=request_data.target_nutrition.proteins,
+            target_fats=request_data.target_nutrition.fats,
+            target_carbs=request_data.target_nutrition.carbs,
+            allowed_recipes=[r.model_dump() for r in request_data.allowed_recipes],
+            chatgpt_response_raw=chatgpt_result,
+            client_ip=client_ip
+        )
+        
+        db.add(db_meal_plan)
+        db.commit()
+        db.refresh(db_meal_plan)
+        
+        logger.info(f"Программа питания сохранена в БД с ID: {db_meal_plan.id}")
+        
+        # Проверяем общее превышение по всем дням
+        total_excess_days = 0
+        for day_plan in days_plan:
+            target_cal = day_plan.target_nutrition.calories
+            actual_cal = day_plan.actual_nutrition.calories
+            if actual_cal > target_cal * 1.1:  # Превышение более 10%
+                total_excess_days += 1
+        
+        # Формируем сообщение с предупреждением, если есть превышение
+        message = f"Программа питания успешно создана на {request_data.days_count} дней"
+        if total_excess_days > 0:
+            message += f". ВНИМАНИЕ: В {total_excess_days} дне(днях) превышение целевых КБЖУ более чем на 10%. Рекомендуется пересмотреть программу."
+            logger.warning(f"Обнаружено превышение КБЖУ в {total_excess_days} днях из {request_data.days_count}")
+        
+        processing_time = time.time() - start_time
+        
+        return MealPlanResponse(
+            days=days_plan,
+            message=message,
+            processing_time_seconds=round(processing_time, 2)
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Ошибка при создании программы питания: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Внутренняя ошибка сервера: {str(e)}"
         )
 
 if __name__ == "__main__":

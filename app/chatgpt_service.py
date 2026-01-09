@@ -9,7 +9,7 @@ import os
 import json
 import logging
 import time
-from typing import Dict, Optional
+from typing import Dict, Optional, List
 from dotenv import load_dotenv
 import httpx
 
@@ -278,6 +278,232 @@ class ChatGPTNutritionService:
                 logger.error(f"HTTP статус: {e.status_code}")
             if hasattr(e, 'response'):
                 logger.error(f"Ответ сервера: {e.response}")
+            logger.debug("Детали ошибки API:", exc_info=True)
+            return None
+        except Exception as e:
+            logger.error(f"Неожиданная ошибка при запросе к ChatGPT: {e}")
+            logger.error(f"Тип ошибки: {type(e).__name__}")
+            logger.debug("Полный traceback:", exc_info=True)
+            return None
+    
+    async def generate_meal_plan(
+        self,
+        meals_per_day: int,
+        days_count: int,
+        target_calories: float,
+        target_proteins: float,
+        target_fats: float,
+        target_carbs: float,
+        allowed_recipes: List[Dict]
+    ) -> Optional[Dict]:
+        """
+        Генерирует программу питания через ChatGPT
+        
+        Args:
+            meals_per_day: Количество приемов пищи в день (минимум 3)
+            days_count: Количество дней
+            target_calories: Целевые калории
+            target_proteins: Целевые белки (граммы)
+            target_fats: Целевые жиры (граммы)
+            target_carbs: Целевые углеводы (граммы)
+            allowed_recipes: Список доступных рецептов
+            
+        Returns:
+            dict с программой питания или None если ошибка/отключен
+        """
+        if not self.enabled:
+            logger.debug("ChatGPT отключен, пропуск запроса")
+            return None
+        
+        try:
+            logger.info(f"Начало генерации программы питания: {days_count} дней, {meals_per_day} приемов пищи в день")
+            
+            # Формируем список рецептов для промпта
+            recipes_text = "\n".join([
+                f"- UUID: {r['uuid']}, Название: {r['name']}, Категория: {r['category']}, "
+                f"КБЖУ на 1 порцию: {r['calories']} ккал, {r['proteins']}г белков, {r['fats']}г жиров, {r['carbs']}г углеводов"
+                for r in allowed_recipes
+            ])
+            
+            # Рассчитываем примерное количество порций для справки и создаем детальный пример расчета
+            if allowed_recipes:
+                avg_calories_per_portion = sum(r['calories'] for r in allowed_recipes) / len(allowed_recipes)
+                estimated_portions = max(1, int(target_calories / avg_calories_per_portion)) if avg_calories_per_portion > 0 else 1
+                
+                # Создаем конкретный пример расчета для первых двух рецептов
+                example_calc = ""
+                if len(allowed_recipes) >= 2:
+                    r1 = allowed_recipes[0]
+                    r2 = allowed_recipes[1]
+                    max_portions_r1 = int(target_calories * 0.6 / r1['calories']) if r1['calories'] > 0 else 0
+                    max_portions_r2 = int(target_calories * 0.4 / r2['calories']) if r2['calories'] > 0 else 0
+                    example_calc = f"\n\nКОНКРЕТНЫЙ ПРИМЕР РАСЧЕТА:\n"
+                    example_calc += f"Если использовать '{r1['name']}' ({r1['calories']} ккал/порция) и '{r2['name']}' ({r2['calories']} ккал/порция):\n"
+                    example_calc += f"- Для достижения {target_calories} ккал можно взять примерно {max_portions_r1} порций '{r1['name']}' ({max_portions_r1 * r1['calories']} ккал) и {max_portions_r2} порций '{r2['name']}' ({max_portions_r2 * r2['calories']} ккал)\n"
+                    example_calc += f"- Итого: {max_portions_r1 * r1['calories'] + max_portions_r2 * r2['calories']} ккал (целевые: {target_calories} ккал)\n"
+                    example_calc += f"- НЕ превышай {int(target_calories * 1.1)} ккал (максимум +10%)"
+                
+                portions_hint = f"\n\nПРИМЕРНЫЙ РАСЧЕТ: При средних {avg_calories_per_portion:.1f} ккал на порцию, для достижения {target_calories} ккал нужно примерно {estimated_portions} порций в день (это ориентир, распределяй по приемам пищи).{example_calc}"
+            else:
+                portions_hint = ""
+            
+            # Подготовка промпта
+            prompt = f"""Ты профессиональный диетолог и опытный спортсмен с большим опытом составления программ питания.
+
+Составь программу питания на {days_count} дней с {meals_per_day} приемами пищи в день.
+
+ЦЕЛЕВЫЕ КБЖУ НА ДЕНЬ:
+- Калории: {target_calories} ккал
+- Белки: {target_proteins} г
+- Жиры: {target_fats} г
+- Углеводы: {target_carbs} г
+
+ДОСТУПНЫЕ РЕЦЕПТЫ (используй ТОЛЬКО эти рецепты, никакие другие):
+{recipes_text}{portions_hint}
+
+КРИТИЧЕСКИ ВАЖНЫЕ ПРАВИЛА:
+1. Используй ТОЛЬКО рецепты из списка выше. Запрещено использовать какие-либо другие рецепты.
+2. Строго соблюдай количество приемов пищи в день: {meals_per_day} (минимум 3).
+3. Обязательно должны быть включены: завтрак, обед, ужин. Остальные приемы пищи опциональны.
+4. КРИТИЧЕСКИ ВАЖНО - СТРОГИЙ РАСЧЕТ ПОРЦИЙ (ОБЯЗАТЕЛЬНО СЛЕДУЙ ЭТОМУ АЛГОРИТМУ):
+   ШАГ 1: Для каждого дня рассчитай общее количество порций каждого блюда
+   ШАГ 2: Используй формулу: сумма(калории_блюда * количество_порций_этого_блюда_за_день) ≤ {target_calories} * 1.1
+   ШАГ 3: Пример расчета:
+     - Если блюдо "Яичница" имеет 5 ккал на порцию, и ты используешь его 4 раза в день по 4 порции = 16 порций всего
+     - Калории от "Яичницы": 5 * 16 = 80 ккал
+     - Если блюдо "Котлеты" имеет 5 ккал на порцию, и ты используешь его 2 раза в день по 8 порций = 16 порций всего
+     - Калории от "Котлет": 5 * 16 = 80 ккал
+     - ИТОГО за день: 80 + 80 = 160 ккал (ПРЕВЫШЕНИЕ! Целевые: {target_calories} ккал)
+   ШАГ 4: ПРАВИЛЬНЫЙ расчет для целевых {target_calories} ккал:
+     - Максимум порций "Яичницы" (5 ккал): {int(target_calories * 0.5 / 5) if target_calories > 0 else 0} порций = {int(target_calories * 0.5 / 5) * 5 if target_calories > 0 else 0} ккал
+     - Максимум порций "Котлет" (5 ккал): {int(target_calories * 0.5 / 5) if target_calories > 0 else 0} порций = {int(target_calories * 0.5 / 5) * 5 if target_calories > 0 else 0} ккал
+     - ИТОГО: {int(target_calories * 0.5 / 5) * 5 * 2 if target_calories > 0 else 0} ккал (в пределах целевых {target_calories} ккал)
+   ШАГ 5: ВСЕГДА проверяй итоговую сумму перед отправкой! Сумма НЕ должна превышать {int(target_calories * 1.1)} ккал
+5. Распределяй КБЖУ по приемам пищи согласно целевым значениям.
+6. Подбирай блюда с учетом целевых КБЖУ с допуском ±5-10% (НЕ превышай более чем на 10%).
+7. Для анализа КБЖУ используй СТРОГО данные из списка рецептов выше. Запрещено самостоятельно проверять или изменять КБЖУ.
+7. Учитывай категории еды: обед не клади в завтрак, но ужин может быть выбран и на обед. Салаты можно добавлять куда угодно.
+8. Обеспечь разнообразие блюд, если это возможно исходя из доступных рецептов.
+9. НЕ обязательно использовать ВСЕ рецепты - главное соответствие КБЖУ за день.
+10. ОБЯЗАТЕЛЬНО ОБЪЕДИНЯЙ ГАРНИРЫ С ОСНОВНЫМИ БЛЮДАМИ:
+    - Гарниры (пюре, рис, гречка, макароны, картофель и т.д.) НЕ должны быть отдельным приемом пищи по возможности (при наличии этих блюд)
+    - Гарниры должны быть объединены с основными блюдами (котлеты, курица, рыба, мясо и т.д.) в ОДИН прием пищи по возможности (при наличии основных блюд)
+    - Если в списке есть гарнир и основное блюдо одной категории (например, оба "Обед"), они ДОЛЖНЫ быть в одном приеме пищи
+11. ИСПОЛЬЗУЙ КОЛИЧЕСТВО ПОРЦИЙ ВМЕСТО ДУБЛИРОВАНИЯ:
+    - Если нужно больше КБЖУ от одного блюда, используй поле "portions" (количество порций)
+    - Например: {{"uuid": "пюре-uuid", "name": "Пюре", "portions": 2}} означает 2 порции пюре
+    - НЕ дублируй одно и то же блюдо несколько раз в массиве - используй поле "portions"
+    - Если нужно больше КБЖУ, предпочтительно комбинируй РАЗНЫЕ блюда, но можно и увеличить порции одного блюда
+12. Желательно учитывать, что блюдо, приготовленное на вечер, может быть съедено и на обед следующего дня (экономия готовки).
+
+Ответь строго в JSON формате:
+{{
+    "days": [
+        {{
+            "day_number": 1,
+            "meals": [
+                {{
+                    "category": "завтрак",
+                    "meals": [
+                        {{"uuid": "uuid-рецепта", "name": "название рецепта", "portions": 1}},
+                        {{"uuid": "uuid-другого-рецепта", "name": "название другого рецепта", "portions": 2}}
+                    ]
+                }},
+                {{
+                    "category": "обед",
+                    "meals": [
+                        {{"uuid": "uuid-рецепта", "name": "название рецепта", "portions": 1}}
+                    ]
+                }},
+                {{
+                    "category": "ужин",
+                    "meals": [
+                        {{"uuid": "uuid-рецепта", "name": "название рецепта", "portions": 1}}
+                    ]
+                }}
+            ]
+        }},
+        {{
+            "day_number": 2,
+            "meals": [...]
+        }}
+    ]
+}}
+
+Важно:
+- Для каждого дня укажи все приемы пищи ({meals_per_day} штук)
+- Категории: "завтрак", "обед", "ужин", "перекус", "полдник" и т.д.
+- В каждом приеме пищи может быть одно или несколько блюд (объединение)
+- Если нужно больше КБЖУ от одного блюда, используй поле "portions" (количество порций) вместо дублирования блюда
+- Например: {{"uuid": "пюре-uuid", "name": "Пюре", "portions": 2}} означает 2 порции пюре
+- Гарниры желательно объединяй с основными блюдами в один прием пищи
+- UUID и название должны точно соответствовать данным из списка рецептов
+- КРИТИЧЕСКИ ВАЖНО: Сумма КБЖУ всех блюд за день (с учетом количества порций) НЕ ДОЛЖНА превышать {int(target_calories * 1.1)} ккал (максимум +10% от {target_calories} ккал)
+- Формула расчета: сумма(калории_блюда * portions_в_каждом_приеме_пищи) должна быть ≤ {int(target_calories * 1.1)} ккал
+- ВАЖНО: Если блюдо используется в нескольких приемах пищи, суммируй все порции этого блюда за день!
+  Пример: если "Яичница" (5 ккал) используется в завтраке (4 порции), перекусе (4 порции), полднике (4 порции) = 12 порций всего за день = 12 * 5 = 60 ккал
+- ВСЕГДА перед отправкой ответа:
+  1. Подсчитай общее количество порций каждого блюда за весь день (суммируй по всем приемам пищи)
+  2. Умножь на калории одной порции
+  3. Сложи все блюда
+  4. Проверь: сумма ≤ {int(target_calories * 1.1)} ккал
+  5. Если превышает - УМЕНЬШИ количество порций!
+- Пример правильного объединения: [{{"uuid": "котлеты-uuid", "name": "Куриные котлетки", "portions": 1}}, {{"uuid": "пюре-uuid", "name": "Пюре", "portions": 1}}] - это ОДИН прием пищи с двумя разными блюдами
+- Если нужно больше калорий от пюре: {{"uuid": "пюре-uuid", "name": "Пюре", "portions": 2}} - две порции пюре"""
+            
+            # Запрос к ChatGPT API
+            model = "gpt-4o"
+            logger.info(f"Отправка запроса к ChatGPT API для генерации программы питания (модель: {model})")
+            
+            request_start_time = time.time()
+            response = await self.client.chat.completions.create(
+                model=model,
+                messages=[{
+                    "role": "user",
+                    "content": prompt
+                }],
+                max_tokens=4000,  # Больше токенов для детальной программы
+                temperature=0.3  # Низкая температура для более точного следования инструкциям
+            )
+            request_duration = time.time() - request_start_time
+            
+            logger.info(f"Получен ответ от ChatGPT за {request_duration:.2f} секунд")
+            logger.debug(f"Response ID: {response.id}, Model: {response.model}, Usage: {response.usage}")
+            
+            # Парсим ответ
+            content = response.choices[0].message.content.strip()
+            logger.debug(f"Длина ответа: {len(content)} символов")
+            logger.debug(f"Первые 500 символов ответа: {content[:500]}")
+            
+            # Убираем markdown код блоки если есть
+            original_content = content
+            if "```json" in content:
+                content = content.split("```json")[1].split("```")[0].strip()
+                logger.debug("Удалены markdown блоки ```json")
+            elif "```" in content:
+                content = content.split("```")[1].split("```")[0].strip()
+                logger.debug("Удалены markdown блоки ```")
+            
+            result = json.loads(content)
+            logger.info(f"ChatGPT сгенерировал программу питания на {len(result.get('days', []))} дней")
+            logger.debug(f"Полный результат: {result}")
+            return result
+            
+        except json.JSONDecodeError as e:
+            logger.error(f"Ошибка парсинга JSON ответа ChatGPT: {e}")
+            logger.error(f"Позиция ошибки: строка {e.lineno}, колонка {e.colno}")
+            logger.error(f"Ответ был (первые 500 символов): {content[:500] if 'content' in locals() else 'N/A'}")
+            if 'original_content' in locals():
+                logger.error(f"Оригинальный ответ (первые 500 символов): {original_content[:500]}")
+            return None
+        except openai.APIConnectionError as e:
+            logger.error(f"Ошибка подключения к ChatGPT API: {e}")
+            if self.proxy_url:
+                logger.error(f"Проверьте настройки прокси: {self.proxy_url.split('@')[-1] if '@' in self.proxy_url else self.proxy_url}")
+            logger.debug("Детали ошибки подключения:", exc_info=True)
+            return None
+        except openai.APIError as e:
+            logger.error(f"Ошибка API ChatGPT: {e}")
             logger.debug("Детали ошибки API:", exc_info=True)
             return None
         except Exception as e:
