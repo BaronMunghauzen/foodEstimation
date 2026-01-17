@@ -148,8 +148,11 @@ class ChatGPTNutritionService:
 
 Также оцени примерный вес порции на фотографии в граммах, основываясь на размере блюда, типе посуды и визуальной оценке.
 
-Ответь строго в JSON формате:
+КРИТИЧЕСКИ ВАЖНО: Ты ОБЯЗАН вернуть ответ СТРОГО в JSON формате. Даже если на фотографии нет еды, изображение нечеткое, или ты не можешь распознать блюдо - верни JSON с полем "error".
+
+Если на фотографии ЕСТЬ еда, верни JSON в формате:
 {
+    "error": false,
     "food_name": "название блюда",
     "calories_per_100g": число,
     "proteins_per_100g": число,
@@ -187,7 +190,31 @@ class ChatGPTNutritionService:
     ]
 }
 
+Если на фотографии НЕТ еды (например: предметы, люди, пейзажи, животные и т.д.), верни JSON в формате:
+{
+    "error": true,
+    "error_type": "not_food",
+    "error_message": "На фотографии нет еды"
+}
+
+Если изображение нечеткое, размытое или невозможно распознать блюдо, верни JSON в формате:
+{
+    "error": true,
+    "error_type": "unclear_image",
+    "error_message": "Не удалось распознать блюдо на фотографии"
+}
+
+Если не можешь определить блюдо по другой причине, верни JSON в формате:
+{
+    "error": true,
+    "error_type": "cannot_recognize",
+    "error_message": "Не удалось распознать блюдо"
+}
+
 Важно:
+- ВСЕГДА возвращай JSON, даже при ошибках
+- error_type может быть: "not_food", "unclear_image", "cannot_recognize"
+- error_message должен быть кратким (до 50 символов)
 - estimated_weight_g: оцени вес порции на фотографии на основе визуального анализа (размер блюда, тип посуды)
 - estimated_volume_ml: оцени объем порции в миллилитрах
 - ingredients: массив основных ингредиентов блюда с их КБЖУ на 100г и примерным весом в порции (weight_in_portion_g)
@@ -250,7 +277,43 @@ class ChatGPTNutritionService:
                 content = content.split("```")[1].split("```")[0].strip()
                 logger.debug("Удалены markdown блоки ```")
             
-            result = json.loads(content)
+            # Пытаемся распарсить JSON
+            try:
+                result = json.loads(content)
+            except json.JSONDecodeError:
+                # Если не удалось распарсить, создаем структурированную ошибку
+                logger.warning(f"Ответ ChatGPT не является валидным JSON. Создаю структурированную ошибку.")
+                # Пытаемся определить тип ошибки по тексту ответа
+                content_lower = original_content.lower()
+                if "can't assist" in content_lower or "cannot assist" in content_lower or "sorry" in content_lower:
+                    error_type = "not_food"
+                    error_message = "На фотографии нет еды"
+                elif "unclear" in content_lower or "размыт" in content_lower or "нечетк" in content_lower:
+                    error_type = "unclear_image"
+                    error_message = "Не удалось распознать блюдо на фотографии"
+                else:
+                    error_type = "cannot_recognize"
+                    # Берем первые 50 символов из ответа как сообщение об ошибке
+                    error_message = original_content[:50].strip()
+                    if not error_message:
+                        error_message = "Не удалось распознать блюдо"
+                
+                result = {
+                    "error": True,
+                    "error_type": error_type,
+                    "error_message": error_message
+                }
+                logger.info(f"ChatGPT вернул ошибку: {error_type} - {error_message}")
+                return result
+            
+            # Проверяем наличие ошибки в JSON
+            if result.get("error") is True:
+                error_type = result.get("error_type", "cannot_recognize")
+                error_message = result.get("error_message", "Не удалось распознать блюдо")
+                logger.info(f"ChatGPT вернул ошибку в JSON: {error_type} - {error_message}")
+                return result
+            
+            # Успешное распознавание
             logger.info(f"ChatGPT распознал: {result.get('food_name')} (калории: {result.get('calories_per_100g')}, уверенность: {result.get('confidence', 0):.2f})")
             logger.debug(f"Полный результат: {result}")
             return result

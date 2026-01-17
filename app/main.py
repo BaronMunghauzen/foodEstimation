@@ -208,6 +208,23 @@ async def recognize_food(
                     logger.info("Вызов ChatGPT API...")
                     chatgpt_response = await chatgpt_service.recognize_food(image, user_comment=user_comment)
                     if chatgpt_response:
+                        # Проверяем наличие ошибки в ответе
+                        if chatgpt_response.get("error") is True:
+                            error_type = chatgpt_response.get("error_type", "cannot_recognize")
+                            error_message = chatgpt_response.get("error_message", "Не удалось распознать блюдо")
+                            logger.warning(f"ChatGPT вернул ошибку: {error_type} - {error_message}")
+                            # Возвращаем структурированный ответ с ошибкой
+                            return JSONResponse(
+                                status_code=400,
+                                content={
+                                    "error": True,
+                                    "error_type": error_type,
+                                    "error_message": error_message,
+                                    "recognized_foods": [],
+                                    "message": f"Ошибка распознавания: {error_message}",
+                                    "processing_time_seconds": round(time.time() - start_time, 2)
+                                }
+                            )
                         chatgpt_result = chatgpt_response
                         use_chatgpt_for_response = True
                         logger.info(f"ChatGPT успешно обработал запрос: {chatgpt_result.get('food_name')}")
